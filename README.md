@@ -12,7 +12,7 @@ ImageAnalyzerAI is a high-performance desktop application that leverages local m
 
 Analyze and search images locally using AI-powered descriptions and semantic embeddings — perfect for organizing memes, emotes, or any large image collection.
 
-<img src="./demo.gif" width="85%" height="85%"/>
+<img src="./demo.png" width="85%" height="85%" alt="Demo preview"/>
 
 ## 🚀 Features
 
