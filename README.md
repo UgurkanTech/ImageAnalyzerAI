@@ -1,6 +1,18 @@
+<p align="center">
+  <img src="./icon.jpg" width="25%" height="25%"/>
+</p>
+
 # 🧠 ImageAnalyzerAI by UgurkanTech
 
 ImageAnalyzerAI is a high-performance desktop application that leverages local multimodal AI models to generate rich image descriptions and semantic embeddings. Designed for power users and researchers, it supports fast batch processing, semantic search, and database-backed storage — all wrapped in a sleek PyQt5 GUI.
+
+![Visitors](https://api.visitorbadge.io/api/visitors?path=https%3A%2F%2Fgithub.com%2FUgurkanTech%2FImageAnalyzerAI&countColor=%23263759)
+
+## ▶️ Demo
+
+Analyze and search images locally using AI-powered descriptions and semantic embeddings — perfect for organizing memes, emotes, or any large image collection.
+
+<img src="./demo.gif" width="75%" height="75%"/>
 
 ## 🚀 Features
 
