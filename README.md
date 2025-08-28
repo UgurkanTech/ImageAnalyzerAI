@@ -34,15 +34,20 @@ Analyze and search images locally using AI-powered descriptions and semantic emb
 
 	
 ## 🛠️ Requirements
-- Python 3.9+
-- Ollama running locally (http://localhost:11434)
-- PyQt5
-- NumPy
-- Requests
 
-## Install dependencies:
+To run ImageAnalyzerAI, make sure the following are installed and properly configured:
+
+- **Python 3.9+** — Recommended for compatibility with PyQt5 and multithreading.
+- **Ollama running locally** at `http://localhost:11434` — You must have at least one **vision model** and one **embedding model** pulled.
+- **Python packages**:
+  - `PyQt5` — For the graphical user interface.
+  - `NumPy` — For handling embedding vectors and similarity calculations.
+  - `Requests` — For communicating with the Ollama API.
+
+Install all required packages using:
 `pip install -r requirements.txt`
 
+> A PyInstaller build script is included to generate a compact standalone `.exe` for portable distribution without requiring Python on the target system.
 
 ## 📂 Usage
 1. **Start Ollama locally** and ensure that at least one **vision model** and one **embedding model** are pulled and available.  
