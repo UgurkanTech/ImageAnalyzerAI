@@ -234,7 +234,6 @@ class DatabaseManager:
             print("[INFO] No embeddings found, falling back to keyword search.")
             return self.keyword_search(db_path, query)
 
-        
         embedding_model = self.get_embedding_model_from_db(db_path)
         if not embedding_model:
             print("[ERROR] Could not determine embedding model from DB.")
@@ -261,17 +260,17 @@ class DatabaseManager:
 
         similarities = cosine_similarity_numpy(query_vector, embedding_matrix)
 
-        # Rank and filter
+        # Rank and filter (semantic order)
         ranked = sorted(zip(image_paths, similarities), key=lambda x: x[1], reverse=True)
-        top_matches = [path for path, score in ranked if score > threshold]
+        top_matches = [(path, score) for path, score in ranked if score > threshold]
         print(f"[DEBUG] Found {len(top_matches)} matches above threshold.")
-
 
         if not top_matches:
             best_path, best_score = ranked[0]
             print(f"[INFO] No semantic matches found. Best score was {best_score:.3f}, falling back to keyword search.")
             return self.keyword_search(db_path, query)
 
+        # Query database for those image paths
         conn = sqlite3.connect(str(db_path))
         cursor = conn.cursor()
         placeholders = ",".join("?" for _ in top_matches)
@@ -279,12 +278,16 @@ class DatabaseManager:
             SELECT image_path, image_name, description, created_at
             FROM descriptions
             WHERE image_path IN ({placeholders})
-            ORDER BY created_at DESC
-        """, top_matches)
+        """, [p for p, _ in top_matches])
         results = cursor.fetchall()
         conn.close()
 
-        return results
+        # Reorder results by similarity score (not DB order)
+        results_dict = {row[0]: row for row in results}
+        ordered_results = [results_dict[p] for p, _ in top_matches if p in results_dict]
+
+        return ordered_results
+
     
     
     def get_all_descriptions(self, db_name: str) -> List[Tuple]:
