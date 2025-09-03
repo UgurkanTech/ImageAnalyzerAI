@@ -169,11 +169,23 @@ class DatabaseManager:
         conn.close()
     
     def save_embeddings(self, vision_model: str, embedding_model: str, embeddings_data: Dict):
-        """Save embeddings to pickle file"""
+        """Merge and save embeddings to pickle file (preserve old data)"""
         db_name = self.get_db_name(vision_model, embedding_model)
         embeddings_path = self.data_dir / f"{db_name}_embeddings.pkl"
+
+        # Load existing embeddings
+        if embeddings_path.exists():
+            with open(embeddings_path, "rb") as f:
+                existing = pickle.load(f)
+        else:
+            existing = {}
+
+        # Merge: overwrite only the keys we just processed
+        existing.update(embeddings_data)
+
+        # Save merged result
         with open(embeddings_path, "wb") as f:
-            pickle.dump(embeddings_data, f)
+            pickle.dump(existing, f)
     
     def load_embeddings(self, vision_model: str, embedding_model: str) -> Dict:
         """Load embeddings from pickle file"""
@@ -299,6 +311,16 @@ class DatabaseManager:
             db_name = file.stem.replace("_descriptions", "")
             databases.append(db_name)
         return databases
+    def get_existing_paths(self, vision_model: str, embedding_model: str = None) -> set:
+        """Return a set of all image paths already stored in the DB."""
+        self.init_descriptions_db(vision_model, embedding_model)
+        db_path = self.get_db_path(vision_model, embedding_model, "descriptions")
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT image_path FROM descriptions")
+        existing = {row[0] for row in cursor.fetchall()}
+        conn.close()
+        return existing
 
 
 
@@ -360,6 +382,25 @@ class ProcessingWorker(QThread):
             failed_descriptions = []
 
             processing_start_time = time.time()
+            
+            
+            existing_paths = self.db_manager.get_existing_paths(self.vision_model, self.embedding_model)
+
+            # Filter out images that are already processed
+            unprocessed_paths = [p for p in self.image_paths if p not in existing_paths]
+
+            if not unprocessed_paths:
+                print("[INFO] All images already have descriptions in DB — skipping processing.")
+                self.progress.emit(100)
+                self.finished.emit({"descriptions": {}, "embeddings": {}})
+                return
+
+            self.image_paths = unprocessed_paths
+            total_images = len(self.image_paths)
+
+            print(f"[INFO] {len(existing_paths)} images already processed — skipping them.")
+            print(f"[INFO] {total_images} images left to process.")
+            
 
             def describe_task(image_path):
                 description = self.ollama_client.generate_description(
@@ -1261,9 +1302,6 @@ class MainWindow(QMainWindow):
         self.log_verbose(f"Processing completed: {len(descriptions)} descriptions, {len(embeddings)} embeddings")
         self.refresh_databases()
         
-        # Auto-load descriptions if database is selected
-        if self.desc_db_combo.currentText():
-            self.load_descriptions()
     
     def processing_error(self, error_msg):
         """Handle processing error"""
