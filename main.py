@@ -732,22 +732,34 @@ class MainWindow(QMainWindow):
         vision_keywords = {"clip", "llava", "blip", "vision", "mllama", "qwen25vl"}
         embedding_keywords = {"embed", "nomic", "e5", "bge", "text-embedding", "bert"}
 
-        vision = []
-        embedding = []
+        vision: List[str] = []
+        embedding: List[str] = []
 
         for model in models:
-            name = model.get("name", "").lower()
-            details = model.get("details", {})
-            families = [f.lower() for f in details.get("families", [])]
+            # Model name (safe)
+            name = (model.get("name") or "").lower()
+
+            # Details may be None
+            details = model.get("details") or {}
+
+            # Families may be None or non-list
+            families = details.get("families")
+            if not isinstance(families, list):
+                families = []
+
+            families = [f.lower() for f in families if isinstance(f, str)]
 
             # Vision model if any family matches
             if any(f in vision_keywords for f in families):
-                vision.append(model["name"])
+                vision.append(model.get("name", ""))
+
             # Embedding model if any family matches or name contains 'embed'
             elif any(f in embedding_keywords for f in families) or "embed" in name:
-                embedding.append(model["name"])
-            #else:
-            #    print(f"[Unclassified] {model['name']} → families: {families}")
+                embedding.append(model.get("name", ""))
+
+            # Optional debug
+            # else:
+            #     print(f"[Unclassified] {model.get('name')} → families: {families}")
 
         return vision, embedding
 
