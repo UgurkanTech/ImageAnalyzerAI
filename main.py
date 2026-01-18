@@ -917,7 +917,8 @@ class MainWindow(QMainWindow):
 
 
     def split_models_by_families(self, models: List[dict]) -> Tuple[List[str], List[str]]:
-        vision_keywords = {"clip", "llava", "blip", "vision", "mllama", "qwen25vl"}
+        vision_keywords = {"clip", "llava", "blip", "vision", "mllama", "qwen25vl", "mistral3"}
+        vision_name_patterns = ["ministral", "qwen3-vl", "qwen2.5vl", "-vl", "moondream", "granite", "-vision", "-ocr"]
         embedding_keywords = {"embed", "nomic", "e5", "bge", "text-embedding", "bert"}
 
         vision: List[str] = []
@@ -937,9 +938,19 @@ class MainWindow(QMainWindow):
 
             families = [f.lower() for f in families if isinstance(f, str)]
 
-            # Vision model if any family matches
-            if any(f in vision_keywords for f in families):
+            # Also check capabilities if available
+            capabilities = details.get("capabilities", [])
+            if isinstance(capabilities, list):
+                capabilities = [c.lower() for c in capabilities if isinstance(c, str)]
+                families.extend(capabilities)
+
+            # Check if name contains vision patterns
+            name_is_vision = any(pattern in name for pattern in vision_name_patterns)
+
+            # Vision model if any family/capability matches OR name contains vision pattern
+            if any(f in vision_keywords for f in families) or name_is_vision:
                 vision.append(model.get("name", ""))
+                print(f"[Vision Model] {model.get('name')} → families+capabilities: {families}, name_match: {name_is_vision}")
 
             # Embedding model if any family matches or name contains 'embed'
             elif any(f in embedding_keywords for f in families) or "embed" in name:
