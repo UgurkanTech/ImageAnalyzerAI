@@ -27,7 +27,7 @@ from PyQt5.QtWidgets import (
     QListWidgetItem, QScrollArea, QGridLayout, QMessageBox, QTabWidget,
     QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox, QSlider, QSizePolicy
 )
-from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer, QMimeData, QByteArray, QUrl, QBuffer, QIODevice, QObject
+from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer, QMimeData, QByteArray, QUrl, QBuffer, QIODevice, QObject, QEvent
 from PyQt5.QtGui import QPixmap, QFont, QPalette, QColor, QIcon
 import numpy as np
 import threading
@@ -647,6 +647,7 @@ class ImageWidget(QLabel):
         try:
             pixmap = QPixmap(self.image_path)
             if not pixmap.isNull():
+                # Use smooth transformation for better quality thumbnails
                 scaled_pixmap = pixmap.scaled(
                     190, 190, Qt.KeepAspectRatio, Qt.SmoothTransformation
                 )
@@ -824,10 +825,10 @@ class MainWindow(QMainWindow):
     
     def init_ui(self):
         self.setWindowTitle("Image Analyzer")
-        self.setGeometry(100, 100, 1400, 775)
+        self.setGeometry(100, 100, 1050, 750)
         # Record the opening height and set a low initial minimum size; enforcement will set final min
         self._opening_height = self.geometry().height()
-        self.setMinimumSize(800, 300)
+        self.setMinimumSize(730, 300)
         
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -871,6 +872,11 @@ class MainWindow(QMainWindow):
 
         QApplication.clipboard().setMimeData(mime_data)
         self.log_verbose("Copied image to clipboard from database")
+
+    def _scroll_verbose_to_bottom(self):
+        """Scroll verbose output to bottom"""
+        scrollbar = self.verbose_text.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
 
     def _enforce_min_height(self):
         """Compute and enforce a reasonable minimum main window height based on control panel size.
@@ -984,7 +990,7 @@ class MainWindow(QMainWindow):
         panel.setMaximumWidth(500)
         layout = QVBoxLayout(panel)
         layout.setSpacing(10)
-        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setContentsMargins(10, 10, 10, 0)
         
         # Directory selection
         dir_group = QGroupBox("Directory Selection")
@@ -1163,8 +1169,10 @@ class MainWindow(QMainWindow):
         # allow the widget to shrink vertically before scrollbars appear
         self.verbose_text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
         # smaller minimum so verbose doesn't dominate space
-        self.verbose_text.setMinimumHeight(70)
+        self.verbose_text.setMinimumHeight(40)
         self.verbose_text.setReadOnly(True)
+        # Keep scrollbar at bottom when content changes
+        self.verbose_text.textChanged.connect(self._scroll_verbose_to_bottom)
         verbose_layout.addWidget(self.verbose_text)
 
         layout.addWidget(verbose_group)
@@ -1213,17 +1221,98 @@ class MainWindow(QMainWindow):
         self.image_container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.image_grid_layout = QGridLayout(self.image_container)
         self.image_grid_layout.setSpacing(10)
+        # keep track of image widgets so we can relayout responsively
+        self.image_widgets = []
+        # remember scroll area and listen for viewport resize events to adjust columns
+        self.image_scroll_area = scroll_area
+        self.image_scroll_area.viewport().installEventFilter(self)
         
         scroll_area.setWidget(self.image_container)
         layout.addWidget(scroll_area)
         
         return widget
+
+    def eventFilter(self, obj, event):
+        # Handle resize events from the scroll area viewport to relayout images
+        viewport = getattr(self, 'image_scroll_area', None)
+        if viewport is not None:
+            viewport = viewport.viewport()
+        if obj is viewport and event.type() == QEvent.Resize:
+            # Debounce: restart timer on each resize event, relayout only after resizing stops
+            if not hasattr(self, '_relayout_timer'):
+                self._relayout_timer = QTimer()
+                self._relayout_timer.setSingleShot(True)
+                self._relayout_timer.timeout.connect(self._relayout_image_grid)
+            self._relayout_timer.start(150)  # 150ms debounce delay
+            return False
+        return super().eventFilter(obj, event)
+
+    def _clear_image_grid(self):
+        # Remove widgets from the grid but keep references if needed
+        for i in reversed(range(self.image_grid_layout.count())):
+            item = self.image_grid_layout.itemAt(i)
+            w = item.widget() if item else None
+            if w:
+                self.image_grid_layout.removeWidget(w)
+                w.setParent(None)
+
+    def _relayout_image_grid(self):
+        # Prevent re-entrant relayouts
+        if getattr(self, '_relayouting', False):
+            return
+        self._relayouting = True
+
+        try:
+            # Calculate number of columns based on available width and widget size
+            if not hasattr(self, 'image_widgets') or not self.image_widgets:
+                return
+
+            # Use scroll area viewport width (visible area) instead of container width
+            if hasattr(self, 'image_scroll_area') and self.image_scroll_area is not None:
+                available = max(100, self.image_scroll_area.viewport().width())
+            else:
+                available = max(100, self.image_container.width())
+            spacing = self.image_grid_layout.spacing()
+            margins = self.image_grid_layout.contentsMargins()
+            # compute usable width inside margins
+            usable = max(100, available - (margins.left() + margins.right()))
+
+            # ImageWidget fixed width is usually 200; prefer actual widget width if available
+            item_w = 200
+            try:
+                if self.image_widgets and self.image_widgets[0].width() > 0:
+                    item_w = self.image_widgets[0].width()
+            except Exception:
+                pass
+            # include spacing between items in calculation
+            cols = max(1, usable // (item_w + spacing))
+
+            # Avoid redundant relayouts
+            last = getattr(self, '_last_cols', None)
+            if last == cols:
+                for w in self.image_widgets:
+                    w.show()
+                return
+            self._last_cols = cols
+
+            # Clear layout and re-add widgets
+            self._clear_image_grid()
+            for idx, w in enumerate(self.image_widgets):
+                row = idx // cols
+                col = idx % cols
+                self.image_grid_layout.addWidget(w, row, col)
+                w.show()
+
+            # Minor repaint call; avoid forcing geometry changes that trigger resize loops
+            self.image_container.update()
+        finally:
+            self._relayouting = False
     
     def create_search_results(self):
         widget = QWidget()
         widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout = QVBoxLayout(widget)
-        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setContentsMargins(10, 10, 10, 10)
         
         self.search_table = QTableWidget()
         self.search_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -1232,6 +1321,7 @@ class MainWindow(QMainWindow):
         self.search_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.search_table.setAlternatingRowColors(True)
         self.search_table.setSelectionBehavior(QTableWidget.SelectRows)
+
         
         layout.addWidget(self.search_table)
         return widget
@@ -1248,7 +1338,7 @@ class MainWindow(QMainWindow):
 
         self.desc_db_combo = QComboBox()
         # prefer flexible width but keep usable minimum
-        self.desc_db_combo.setMinimumWidth(220)
+        self.desc_db_combo.setMinimumWidth(120)
         self.desc_db_combo.setFixedHeight(28)
         self.desc_db_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         db_select_layout.addWidget(self.desc_db_combo)
@@ -1436,25 +1526,56 @@ class MainWindow(QMainWindow):
                 background-color: #555;
                 border-radius: 7px;
                 min-height: 30px;
-                margin: 15px 0 15px 0;  /* Keep clear of arrows */
+                margin: 0; /* Use full length, no arrow margins */
             }
             QScrollBar::handle:vertical:hover {
                 background-color: #0078d4;
             }
+            /* Hide arrow areas for vertical scrollbars */
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-                background-color: #2b2b2b;
+                background: transparent;
                 border: none;
-                height: 15px;
-            }
-            QScrollBar::add-line:vertical:hover, QScrollBar::sub-line:vertical:hover {
-                background-color: #0078d4;
-            }
-            QScrollBar::up-arrow:vertical, QScrollBar::down-arrow:vertical {
-                border: none;
-                width: 0;
                 height: 0;
             }
+            QScrollBar::add-line:vertical:hover, QScrollBar::sub-line:vertical:hover {
+                background: transparent;
+            }
+            QScrollBar::up-arrow:vertical, QScrollBar::down-arrow:vertical {
+                width: 0;
+                height: 0;
+                background: transparent;
+                border: none;
+            }
             QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+                background-color: #2b2b2b;
+            }
+            /* Horizontal scrollbars (symmetrical rules) */
+            QScrollBar:horizontal {
+                background-color: #2b2b2b;
+                height: 15px;
+                border: none;
+            }
+            QScrollBar::handle:horizontal {
+                background-color: #555;
+                border-radius: 7px;
+                min-width: 30px;
+                margin: 0; /* Use full length, no arrow margins */
+            }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                background: transparent;
+                border: none;
+                width: 0;
+            }
+            QScrollBar::add-line:horizontal:hover, QScrollBar::sub-line:horizontal:hover {
+                background: transparent;
+            }
+            QScrollBar::left-arrow:horizontal, QScrollBar::right-arrow:horizontal {
+                width: 0;
+                height: 0;
+                background: transparent;
+                border: none;
+            }
+            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                 background-color: #2b2b2b;
             }
             QScrollArea {
@@ -1510,26 +1631,33 @@ class MainWindow(QMainWindow):
     
     def load_images_preview(self, directory):
         """Load preview of images in directory"""
-        # Clear existing images
-        for i in reversed(range(self.image_grid_layout.count())):
-            child = self.image_grid_layout.itemAt(i).widget()
-            if child:
-                child.setParent(None)
-        
+        # Prevent re-entrant loads
+        if getattr(self, '_loading_images', False):
+            return
+        self._loading_images = True
+
+        # Clear existing images and reset column tracking
+        self._clear_image_grid()
+        self.image_widgets = []
+        self._last_cols = None
+
         # Get unique image files
         image_paths = self.get_image_files(directory)
-        
-        # Display first 20 images as preview
-        cols = 4
-        for i, image_path in enumerate(image_paths[:2000]):
-            row = i // cols
-            col = i % cols
-            
+
+        # Create image widgets and store them for responsive layout
+        # Allow previewing a large number of images (up to a sensible upper bound)
+        max_preview = 2000
+        for image_path in image_paths[:max_preview]:
             image_widget = ImageWidget(str(image_path), logger=self.log_verbose)
             image_widget.setToolTip(f"Click to copy path: {image_path.name}")
-            self.image_grid_layout.addWidget(image_widget, row, col)
-        
-        self.log_verbose(f"Found {len(image_paths)} unique images in directory")
+            self.image_widgets.append(image_widget)
+
+        # Initial layout (defer to allow geometry to settle)
+        QTimer.singleShot(0, self._relayout_image_grid)
+
+        self._loading_images = False
+
+        self.log_verbose(f"Found {len(image_paths)} unique images in directory (showing {min(len(image_paths), max_preview)})")
     
     def start_processing(self):
         """Start processing images"""
@@ -1749,11 +1877,7 @@ class MainWindow(QMainWindow):
             cursor.movePosition(cursor.Down, cursor.KeepAnchor, 
                               document.blockCount() - 100)
             cursor.removeSelectedText()
-        
-        # Auto-scroll to bottom
-        cursor = self.verbose_text.textCursor()
-        cursor.movePosition(cursor.End)
-        self.verbose_text.setTextCursor(cursor)
+        # Auto-scroll is handled by textChanged signal -> _scroll_verbose_to_bottom
 
 
 def resource_path(relative_path):
