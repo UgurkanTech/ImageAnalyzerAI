@@ -118,6 +118,7 @@ class DatabaseManager:
                 image_path TEXT UNIQUE,
                 image_name TEXT,
                 image_hash TEXT,
+                image_data BLOB,
                 description TEXT,
                 prompt TEXT,
                 context_size INTEGER,
@@ -154,7 +155,8 @@ class DatabaseManager:
         
         # Calculate image hash
         with open(image_path, "rb") as f:
-            image_hash = hashlib.md5(f.read()).hexdigest()
+            image_data = f.read()
+            image_hash = hashlib.md5(image_data).hexdigest()
         
         image_name = Path(image_path).name
         
@@ -162,9 +164,9 @@ class DatabaseManager:
         cursor = conn.cursor()
         cursor.execute("""
             INSERT OR REPLACE INTO descriptions 
-            (image_path, image_name, image_hash, description, prompt, context_size, vision_model, embedding_model)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (image_path, image_name, image_hash, description, prompt, context_size, vision_model, embedding_model))
+            (image_path, image_name, image_hash, image_data, description, prompt, context_size, vision_model, embedding_model)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (image_path, image_name, image_hash, image_data, description, prompt, context_size, vision_model, embedding_model))
         conn.commit()
         conn.close()
     
@@ -324,6 +326,18 @@ class DatabaseManager:
         existing = {row[0] for row in cursor.fetchall()}
         conn.close()
         return existing
+    
+    def get_image_data_from_db(self, db_name: str, image_path: str) -> Optional[bytes]:
+        """Get image data from specific database"""
+        db_path = self.data_dir / f"{db_name}_descriptions.db"
+        if not db_path.exists():
+            return None
+        conn = sqlite3.connect(str(db_path))
+        cursor = conn.cursor()
+        cursor.execute("SELECT image_data FROM descriptions WHERE image_path = ?", (image_path,))
+        row = cursor.fetchone()
+        conn.close()
+        return row[0] if row and row[0] else None
 
 
 
@@ -607,14 +621,14 @@ class SearchThread(QThread):
 
 
 class ClickableLabel(QLabel):
-    clicked = pyqtSignal(str)  # Emit image path on click
+    clicked = pyqtSignal(object)  # Emit image_data (bytes)
 
-    def __init__(self, image_path, parent=None):
+    def __init__(self, image_data: bytes, parent=None):
         super().__init__(parent)
-        self.image_path = image_path
+        self.image_data = image_data
 
     def mousePressEvent(self, event):
-        self.clicked.emit(self.image_path)
+        self.clicked.emit(self.image_data)
 
 
 class PostInitWorker(QObject):
@@ -706,26 +720,24 @@ class MainWindow(QMainWindow):
         right_panel = self.create_results_panel()
         main_layout.addWidget(right_panel, 2)
         
-    def copy_image_to_clipboard(self, image_path):
-        pixmap = QPixmap(image_path)
-        if pixmap.isNull():
-            self.log_verbose(f"Failed to load image: {image_path}")
+    def copy_image_to_clipboard(self, image_data):
+        if not image_data:
+            self.log_verbose("No image data to copy")
             return
 
-        # Wrap QByteArray in QBuffer
-        byte_array = QByteArray()
+        byte_array = QByteArray(image_data)
         buffer = QBuffer(byte_array)
         buffer.open(QIODevice.WriteOnly)
+        pixmap = QPixmap()
+        pixmap.loadFromData(image_data)
         pixmap.save(buffer, "PNG")
         buffer.close()
 
         mime_data = QMimeData()
         mime_data.setData("image/png", byte_array)
 
-        mime_data.setUrls([QUrl.fromLocalFile(image_path)])
-
         QApplication.clipboard().setMimeData(mime_data)
-        self.log_verbose(f"Copied image to clipboard as PNG: {image_path}")
+        self.log_verbose("Copied image to clipboard from database")
 
 
     def split_models_by_families(self, models: List[dict]) -> Tuple[List[str], List[str]]:
@@ -818,12 +830,12 @@ class MainWindow(QMainWindow):
         
         model_layout.addWidget(QLabel("Vision Model:"))
         self.vision_model_combo = QComboBox()
-        self.vision_model_combo.addItems(["llava:latest", "bakllava:latest"])
+        self.vision_model_combo.addItems(["Loading..."])
         model_layout.addWidget(self.vision_model_combo)
         
         model_layout.addWidget(QLabel("Embedding Model:"))
         self.embedding_model_combo = QComboBox()
-        self.embedding_model_combo.addItems(["nomic-embed-text:latest", "all-minilm:latest"])
+        self.embedding_model_combo.addItems(["Loading..."])
         model_layout.addWidget(self.embedding_model_combo)
         
         layout.addWidget(model_group)
@@ -1326,6 +1338,7 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Error", f"Processing failed: {error_msg}")
     
     def display_search_results(self, results, query):
+        db_name = self.search_db_combo.currentText()
         self.search_table.setRowCount(len(results))
         self.search_table.setAlternatingRowColors(False)
 
@@ -1340,9 +1353,11 @@ class MainWindow(QMainWindow):
             self.search_table.setRowHeight(row, 150)
 
             # Image preview
-            image_label = ClickableLabel(image_path)
-            pixmap = QPixmap(image_path)
-            if not pixmap.isNull():
+            image_data = self.db_manager.get_image_data_from_db(db_name, image_path)
+            image_label = ClickableLabel(image_data)
+            if image_data:
+                pixmap = QPixmap()
+                pixmap.loadFromData(image_data)
                 scaled_pixmap = pixmap.scaled(140, 140, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                 image_label.setPixmap(scaled_pixmap)
             else:
@@ -1410,9 +1425,11 @@ class MainWindow(QMainWindow):
             self.descriptions_table.setRowHeight(row, 100)
 
             # Image preview in column
-            image_label = ClickableLabel(image_path)
-            pixmap = QPixmap(image_path)
-            if not pixmap.isNull():
+            image_data = self.db_manager.get_image_data_from_db(db_name, image_path)
+            image_label = ClickableLabel(image_data)
+            if image_data:
+                pixmap = QPixmap()
+                pixmap.loadFromData(image_data)
                 scaled_pixmap = pixmap.scaled(90, 90, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                 image_label.setPixmap(scaled_pixmap)
             else:
