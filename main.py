@@ -25,24 +25,38 @@ from PyQt5.QtWidgets import (
     QPushButton, QLabel, QLineEdit, QTextEdit, QProgressBar, QComboBox,
     QFileDialog, QListWidget, QSplitter, QGroupBox, QSpinBox,
     QListWidgetItem, QScrollArea, QGridLayout, QMessageBox, QTabWidget,
-    QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox, QSlider
+    QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox, QSlider, QSizePolicy
 )
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer, QMimeData, QByteArray, QUrl, QBuffer, QIODevice, QObject
 from PyQt5.QtGui import QPixmap, QFont, QPalette, QColor, QIcon
 import numpy as np
+import threading
 
-THREAD_COUNT = 24
+import os
+# Ollama processes one request at a time per model on GPU
+# Too many parallel requests just queue up and can cause timeouts
+# 4-8 is optimal: keeps Ollama busy without overwhelming it
+THREAD_COUNT = min(8, (os.cpu_count() or 4))
 
 os.chdir(os.path.dirname(os.path.abspath(sys.argv[0]))) #Fix for direct curring CWD
 
 class OllamaClient:
     def __init__(self, base_url: str = "http://localhost:11434"):
         self.base_url = base_url
+        # Session for connection pooling - reuses TCP connections
+        self._session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=THREAD_COUNT,
+            pool_maxsize=THREAD_COUNT,
+            max_retries=0
+        )
+        self._session.mount('http://', adapter)
+        self._session.mount('https://', adapter)
     
     def get_models(self) -> List[str]:
         """Get available models from Ollama"""
         try:
-            response = requests.get(f"{self.base_url}/api/tags")
+            response = self._session.get(f"{self.base_url}/api/tags", timeout=60)
             if response.status_code == 200:
                 return response.json().get("models", [])
         except:
@@ -65,7 +79,7 @@ class OllamaClient:
                 }
             }
             
-            response = requests.post(f"{self.base_url}/api/generate", json=payload)
+            response = self._session.post(f"{self.base_url}/api/generate", json=payload, timeout=120)
             if response.status_code == 200:
                 return response.json().get("response", "")
         except Exception as e:
@@ -80,7 +94,7 @@ class OllamaClient:
                 "prompt": text
             }
             
-            response = requests.post(f"{self.base_url}/api/embeddings", json=payload)
+            response = self._session.post(f"{self.base_url}/api/embeddings", json=payload, timeout=60)
             if response.status_code == 200:
                 return response.json().get("embedding", [])
         except:
@@ -92,6 +106,7 @@ class DatabaseManager:
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(exist_ok=True)
         self.ollama_client = ollama_client
+        self._image_cache = {}  # Cache for image data to avoid re-querying
 
     
     def get_db_name(self, vision_model: str, embedding_model: str = None) -> str:
@@ -153,11 +168,10 @@ class DatabaseManager:
         self.init_descriptions_db(vision_model, embedding_model)
         db_path = self.get_db_path(vision_model, embedding_model, "descriptions")
         
-        # Calculate image hash
+        # Read file once and calculate hash from same data
         with open(image_path, "rb") as f:
             image_data = f.read()
-            image_hash = hashlib.md5(image_data).hexdigest()
-        
+        image_hash = hashlib.md5(image_data).hexdigest()
         image_name = Path(image_path).name
         
         conn = sqlite3.connect(db_path)
@@ -169,6 +183,37 @@ class DatabaseManager:
         """, (image_path, image_name, image_hash, image_data, description, prompt, context_size, vision_model, embedding_model))
         conn.commit()
         conn.close()
+    
+    def save_descriptions_batch(self, vision_model: str, embedding_model: str, batch_data: Dict[str, Tuple[str, str, int]]):
+        """Save multiple descriptions in one transaction (10-20x faster than individual saves)"""
+        if not batch_data:
+            return
+        
+        self.init_descriptions_db(vision_model, embedding_model)
+        db_path = self.get_db_path(vision_model, embedding_model, "descriptions")
+        
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute("BEGIN TRANSACTION")
+            for image_path, (description, prompt, context_size) in batch_data.items():
+                with open(image_path, "rb") as f:
+                    image_data = f.read()
+                image_hash = hashlib.md5(image_data).hexdigest()
+                image_name = Path(image_path).name
+                
+                cursor.execute("""
+                    INSERT OR REPLACE INTO descriptions 
+                    (image_path, image_name, image_hash, image_data, description, prompt, context_size, vision_model, embedding_model)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (image_path, image_name, image_hash, image_data, description, prompt, context_size, vision_model, embedding_model))
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            raise e
+        finally:
+            conn.close()
     
     def save_embeddings(self, vision_model: str, embedding_model: str, embeddings_data: Dict):
         """Merge and save embeddings to pickle file (preserve old data)"""
@@ -328,7 +373,11 @@ class DatabaseManager:
         return existing
     
     def get_image_data_from_db(self, db_name: str, image_path: str) -> Optional[bytes]:
-        """Get image data from specific database"""
+        """Get image data from specific database with caching"""
+        cache_key = f"{db_name}:{image_path}"
+        if cache_key in self._image_cache:
+            return self._image_cache[cache_key]
+        
         db_path = self.data_dir / f"{db_name}_descriptions.db"
         if not db_path.exists():
             return None
@@ -337,7 +386,11 @@ class DatabaseManager:
         cursor.execute("SELECT image_data FROM descriptions WHERE image_path = ?", (image_path,))
         row = cursor.fetchone()
         conn.close()
-        return row[0] if row and row[0] else None
+        
+        image_data = row[0] if row and row[0] else None
+        if image_data and len(self._image_cache) < 100:  # Limit cache size
+            self._image_cache[cache_key] = image_data
+        return image_data
 
 
 
@@ -367,10 +420,14 @@ class ProcessingWorker(QThread):
         self.embedding_model = embedding_model
         self.prompt = prompt
         self.context_size = context_size
-        self.should_stop = False
+        self._stop_event = threading.Event()  # Thread-safe stop flag
     
     def stop(self):
-        self.should_stop = True
+        self._stop_event.set()
+    
+    @property
+    def should_stop(self):
+        return self._stop_event.is_set()
         
         
     def shorten_filename(filename: str, max_length: int = 40) -> str:
@@ -426,38 +483,56 @@ class ProcessingWorker(QThread):
                 return (image_path, description)
 
             # Phase 1: Generate descriptions in parallel
+            futures = []
             with ThreadPoolExecutor(max_workers=THREAD_COUNT) as executor:
-                for i, result in enumerate(executor.map(describe_task, self.image_paths)):
+                for image_path in self.image_paths:
+                    futures.append(executor.submit(describe_task, image_path))
+
+                completed_count = 0
+                for future in as_completed(futures):
                     if self.should_stop:
                         self.stopped.emit()
                         return
 
-                    image_path, description = result
-                    name = Path(image_path).name
-                    if len(name) > 40:
-                        name = name[:29] + "..." + name[-8:]
+                    completed_count += 1
+                    try:
+                        image_path, description = future.result()
+                        
+                        name = Path(image_path).name
+                        if len(name) > 40:
+                            name = name[:29] + "..." + name[-8:]
 
-                    self.status.emit(f"Processing image {i+1}/{total_images}: {name}")
+                        self.status.emit(f"Processing image {completed_count}/{total_images}: {name}")
 
-                    if description and not description.startswith("Error"):
-                        descriptions[image_path] = description
-                        temp_batch[image_path] = description
-                    else:
-                        print(f"[ERROR] Processing description failed for {name}: {description}")
-                        failed_descriptions.append(image_path)
+                        if description and not description.startswith("Error"):
+                            descriptions[image_path] = description
+                            temp_batch[image_path] = description
+                        else:
+                            print(f"[ERROR] Processing description failed for {name}: {description}")
+                            failed_descriptions.append(image_path)
+                    except Exception as e:
+                        print(f"[ERROR] Future failed with exception: {e}")
+                        # Continue processing other images
+                        continue
 
-
-                    # Sync every batch_size
-                    if len(temp_batch) >= batch_size or i == total_images - 1:
-                        for path, desc in temp_batch.items():
-                            self.db_manager.save_description(
-                                self.vision_model, self.embedding_model, path,
-                                desc, self.prompt, self.context_size
-                            )
+                    # Sync every batch_size using fast batch method
+                    if len(temp_batch) >= batch_size:
+                        batch_prepared = {path: (desc, self.prompt, self.context_size) for path, desc in temp_batch.items()}
+                        self.db_manager.save_descriptions_batch(
+                            self.vision_model, self.embedding_model, batch_prepared
+                        )
                         temp_batch.clear()
 
-                    progress = int((i + 1) / total_images * 50)
+                    progress = int(completed_count / total_images * 50)
                     self.progress.emit(progress)
+
+            # Save any remaining items in temp_batch
+            if temp_batch:
+                batch_prepared = {path: (desc, self.prompt, self.context_size) for path, desc in temp_batch.items()}
+                self.db_manager.save_descriptions_batch(
+                    self.vision_model, self.embedding_model, batch_prepared
+                )
+                temp_batch.clear()
 
             print(f"[INFO] Total images: {total_images}")
             print(f"[INFO] Successful descriptions: {len(descriptions)}")
@@ -487,7 +562,11 @@ class ProcessingWorker(QThread):
 
                     if description and not description.startswith("Error"):
                         descriptions[image_path] = description
-                        temp_batch[image_path] = description
+                        # Save to DB immediately on retry success
+                        self.db_manager.save_description(
+                            self.vision_model, self.embedding_model, image_path,
+                            description, self.prompt, self.context_size
+                        )
                         print(f"[RETRY SUCCESS] {name}")
                     else:
                         print(f"[RETRY FAILED] {name}: {description or 'No response'}")
@@ -502,32 +581,34 @@ class ProcessingWorker(QThread):
                     return (path, emb)
 
                 futures = []
-                paths = list(descriptions.keys())
                 with ThreadPoolExecutor(max_workers=THREAD_COUNT) as executor:
                     for path, desc in descriptions.items():
                         futures.append(executor.submit(embed_task, path, desc))
 
-                    for i, future in enumerate(as_completed(futures)):
+                    completed_embed_count = 0
+                    for future in as_completed(futures):
                         if self.should_stop:
                             self.stopped.emit()
                             return
 
                         try:
                             path, emb = future.result()
+                            completed_embed_count += 1
                             if emb:
                                 embeddings[path] = emb
+                            
+                            # Emit progress (second half: 50–100%)
+                            progress = 50 + int(completed_embed_count / len(futures) * 50)
+                            self.progress.emit(progress)
+
+                            # Emit status text using the actual path from result
+                            name = os.path.basename(path)
+                            if len(name) > 40:
+                                name = name[:29] + "..." + name[-8:]
+                            self.status.emit(f"Embedding {completed_embed_count}/{len(futures)}: {name}")
                         except Exception as e:
-                            print(f"[ERROR] Embedding failed for {path}: {e}")
-
-                        # Emit progress (second half: 50–100%)
-                        progress = 50 + int((i + 1) / len(futures) * 50)
-                        self.progress.emit(progress)
-
-                        # Emit status text
-                        name = os.path.basename(paths[i])
-                        if len(name) > 40:
-                            name = name[:29] + "..." + name[-8:]
-                        self.status.emit(f"Embedding {i+1}/{len(futures)}: {name}")
+                            completed_embed_count += 1
+                            print(f"[ERROR] Embedding future failed: {e}")
 
 
 
@@ -665,6 +746,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         
         self.processing_worker = None
+        self.post_init_thread = None
+        self.search_thread = None
         self.models_loaded = False
         self.ollama_client = OllamaClient()
         self.db_manager = DatabaseManager(ollama_client=self.ollama_client)
@@ -678,47 +761,97 @@ class MainWindow(QMainWindow):
         # Defer heavy setup
         QTimer.singleShot(50, self.start_post_init_tasks)
 
+    def closeEvent(self, event):
+        """Handle window close - cleanup threads and resources without blocking UI"""
+        # Accept event immediately to close window without lag
+        event.accept()
+        
+        # Cleanup threads in background without blocking
+        QTimer.singleShot(0, self._cleanup_threads)
+    
+    def _cleanup_threads(self):
+        """Background cleanup of threads after window closes"""
+        # Stop processing worker if running
+        if self.processing_worker and self.processing_worker.isRunning():
+            print("[CLEANUP] Stopping processing worker...")
+            self.processing_worker.stop()
+            # Give it 2 seconds to finish gracefully
+            if not self.processing_worker.wait(2000):
+                print("[CLEANUP] Force terminating processing worker")
+                self.processing_worker.terminate()
+                self.processing_worker.wait()
+        
+        # Wait for post-init thread
+        if self.post_init_thread and self.post_init_thread.isRunning():
+            print("[CLEANUP] Waiting for post-init thread...")
+            self.post_init_thread.quit()
+            self.post_init_thread.wait(1000)
+        
+        # Wait for search thread
+        if self.search_thread and self.search_thread.isRunning():
+            self.search_thread.wait(1000)
+        
+        # Close Ollama session
+        if hasattr(self.ollama_client, '_session'):
+            self.ollama_client._session.close()
+            print("[CLEANUP] Closed Ollama session")
+        
+        print("[CLEANUP] Cleanup complete")
+
 
     def start_post_init_tasks(self):
         
-        self.thread = QThread()
+        self.post_init_thread = QThread()
         self.worker = PostInitWorker(
             ollama_client=self.ollama_client,
             db_manager=self.db_manager,
             split_models_fn=self.split_models_by_families
         )
-        self.worker.moveToThread(self.thread)
+        self.worker.moveToThread(self.post_init_thread)
 
         # Connect worker signals to MainWindow slots
         self.worker.models_ready.connect(self.update_model_combos)
         self.worker.databases_ready.connect(self.update_database_combos)
 
-        self.thread.started.connect(self.worker.run)
-        self.worker.finished.connect(self.thread.quit)
+        self.post_init_thread.started.connect(self.worker.run)
+        self.worker.finished.connect(self.post_init_thread.quit)
         self.worker.finished.connect(self.worker.deleteLater)
-        self.thread.finished.connect(self.thread.deleteLater)
+        self.post_init_thread.finished.connect(self.post_init_thread.deleteLater)
 
-        self.thread.start()
+        self.post_init_thread.start()
         print("⏳ Loading models and databases...")
       
     
     def init_ui(self):
         self.setWindowTitle("Image Analyzer")
-        self.setGeometry(100, 100, 1400, 900)
+        self.setGeometry(100, 100, 1400, 775)
+        # Record the opening height and set a low initial minimum size; enforcement will set final min
+        self._opening_height = self.geometry().height()
+        self.setMinimumSize(800, 300)
         
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         
         # Main layout
         main_layout = QHBoxLayout(central_widget)
+        main_layout.setSpacing(10)
+        main_layout.setContentsMargins(10, 10, 10, 10)
         
         # Left panel - Controls
         left_panel = self.create_control_panel()
+        left_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        # keep reference to compute dynamic minimum height
+        self.left_panel = left_panel
         main_layout.addWidget(left_panel, 1)
         
         # Right panel - Results
         right_panel = self.create_results_panel()
+        right_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.right_panel = right_panel
         main_layout.addWidget(right_panel, 2)
+
+        # Enforce a minimum main window height after layout settles so controls don't overlap
+        QTimer.singleShot(0, self._enforce_min_height)
         
     def copy_image_to_clipboard(self, image_data):
         if not image_data:
@@ -738,6 +871,43 @@ class MainWindow(QMainWindow):
 
         QApplication.clipboard().setMimeData(mime_data)
         self.log_verbose("Copied image to clipboard from database")
+
+    def _enforce_min_height(self):
+        """Compute and enforce a reasonable minimum main window height based on control panel size.
+
+        This clamps the desired minimum to a percentage of the screen height and only
+        sets the minimum height (does not modify minimum width) so the window remains resizable.
+        """
+        try:
+            if not hasattr(self, 'left_panel') or self.left_panel is None:
+                return
+            left_hint = self.left_panel.sizeHint().height()
+            # lower base and small buffer so the window is not overly large
+            desired = max(320, left_hint + 40)
+
+            # Clamp to 90% of available screen height to avoid locking above screen size
+            screen = QApplication.primaryScreen()
+            max_allowed = None
+            if screen:
+                screen_h = screen.availableGeometry().height()
+                max_allowed = int(screen_h * 0.9)
+                if desired > max_allowed:
+                    desired = max_allowed
+
+            # Enforce minimum equal to the opening height (but not above max_allowed)
+            opening = getattr(self, '_opening_height', self.height())
+            opening_clamped = opening
+            if max_allowed is not None and opening_clamped > max_allowed:
+                opening_clamped = max_allowed
+
+            # Use the opening height as the enforced minimum (clamped to screen max)
+            final_min = opening_clamped
+
+            # Only set minimum height (keep existing minimum width)
+            self.setMinimumHeight(final_min)
+            print(f"[UI] Enforced minimum window height: {final_min} (opening={opening_clamped}, desired={desired})")
+        except Exception as e:
+            print(f"[UI] Failed to enforce min height: {e}")
 
 
     def split_models_by_families(self, models: List[dict]) -> Tuple[List[str], List[str]]:
@@ -808,91 +978,152 @@ class MainWindow(QMainWindow):
     
     def create_control_panel(self):
         panel = QWidget()
+        panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        panel.setMinimumWidth(350)
+        # Prevent the left control panel from growing too wide on large screens
+        panel.setMaximumWidth(500)
         layout = QVBoxLayout(panel)
+        layout.setSpacing(10)
+        layout.setContentsMargins(10, 10, 10, 10)
         
         # Directory selection
         dir_group = QGroupBox("Directory Selection")
+        dir_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         dir_layout = QVBoxLayout(dir_group)
         
+        # Directory path and browse button on same line
+        dir_path_layout = QHBoxLayout()
         self.dir_path_edit = QLineEdit()
         self.dir_path_edit.setPlaceholderText("Select directory containing images...")
-        dir_layout.addWidget(self.dir_path_edit)
+        self.dir_path_edit.setFixedHeight(30)
+        dir_path_layout.addWidget(self.dir_path_edit)
         
-        dir_btn = QPushButton("Browse Directory")
+        dir_btn = QPushButton("Browse")
         dir_btn.clicked.connect(self.browse_directory)
-        dir_layout.addWidget(dir_btn)
+        dir_btn.setMaximumWidth(80)  # Keep button small
+        dir_btn.setFixedHeight(25)
+        dir_path_layout.addWidget(dir_btn)
+        dir_layout.addLayout(dir_path_layout)
         
         layout.addWidget(dir_group)
         
         # Model selection
         model_group = QGroupBox("Model Configuration")
+        model_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         model_layout = QVBoxLayout(model_group)
         
-        model_layout.addWidget(QLabel("Vision Model:"))
+        # Vision, Embedding models, and Context Size on same line
+        models_row = QHBoxLayout()
+        
+        vision_layout = QVBoxLayout()
+        vision_layout.addWidget(QLabel("Vision Model:"))
         self.vision_model_combo = QComboBox()
         self.vision_model_combo.addItems(["Loading..."])
-        model_layout.addWidget(self.vision_model_combo)
+        self.vision_model_combo.setFixedHeight(25)
+        vision_layout.addWidget(self.vision_model_combo)
+        models_row.addLayout(vision_layout, 2)  # Stretch factor 2
         
-        model_layout.addWidget(QLabel("Embedding Model:"))
+        embedding_layout = QVBoxLayout()
+        embedding_layout.addWidget(QLabel("Embedding Model:"))
         self.embedding_model_combo = QComboBox()
         self.embedding_model_combo.addItems(["Loading..."])
-        model_layout.addWidget(self.embedding_model_combo)
+        self.embedding_model_combo.setFixedHeight(25)
+        embedding_layout.addWidget(self.embedding_model_combo)
+        models_row.addLayout(embedding_layout, 2)  # Stretch factor 2
         
-        layout.addWidget(model_group)
-        
-        # Processing parameters
-        params_group = QGroupBox("Processing Parameters")
-        params_layout = QVBoxLayout(params_group)
-        
-        params_layout.addWidget(QLabel("Context Size:"))
+        context_layout = QVBoxLayout()
+        context_layout.addWidget(QLabel("Context Size:"))
         self.context_size_combo = QComboBox()
         self.context_size_combo.addItems(["256", "512", "1024", "2048", "4096", "8192"])
         self.context_size_combo.setCurrentText("2048")
-        params_layout.addWidget(self.context_size_combo)
+        self.context_size_combo.setFixedHeight(25)
+        context_layout.addWidget(self.context_size_combo)
+        models_row.addLayout(context_layout, 1)  # Stretch factor 1 (half size)
         
-        params_layout.addWidget(QLabel("Prompt:"))
+        model_layout.addLayout(models_row)
+        
+        layout.addWidget(model_group)
+        
+        # Processing parameters (now just prompt)
+        params_group = QGroupBox("Prompt")
+        params_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        params_layout = QVBoxLayout(params_group)
+        
+        # Prompt section - now takes full width (no inner label needed)
         self.prompt_edit = QTextEdit()
         self.prompt_edit.setPlainText("Describe this image in detail, including objects, colors, composition, and any text visible.")
-        self.prompt_edit.setMaximumHeight(100)
+        self.prompt_edit.setFixedHeight(50)
+        self.prompt_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         params_layout.addWidget(self.prompt_edit)
         
         layout.addWidget(params_group)
         
         # Processing controls
         process_group = QGroupBox("Processing")
+        process_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         process_layout = QVBoxLayout(process_group)
         
+        # Buttons row
+        buttons_layout = QHBoxLayout()
         self.process_btn = QPushButton("Start Processing")
         self.process_btn.clicked.connect(self.start_processing)
-        process_layout.addWidget(self.process_btn)
+        self.process_btn.setMinimumWidth(120)  # Ensure minimum width
+        self.process_btn.setFixedHeight(25)
+        buttons_layout.addWidget(self.process_btn)
         
         self.stop_btn = QPushButton("Stop Processing")
         self.stop_btn.clicked.connect(self.stop_processing)
-
         self.stop_btn.setEnabled(False)
-        process_layout.addWidget(self.stop_btn)
+        self.stop_btn.setMinimumWidth(120)  # Ensure minimum width
+        self.stop_btn.setFixedHeight(25)
+        buttons_layout.addWidget(self.stop_btn)
+        process_layout.addLayout(buttons_layout)
         
         self.progress_bar = QProgressBar()
+        self.progress_bar.setFormat("Ready")  # Default text so it doesn't look like input field
+        self.progress_bar.setFixedHeight(20)
         process_layout.addWidget(self.progress_bar)
         
         self.status_label = QLabel("Ready")
+        self.status_label.setFixedHeight(20)
         process_layout.addWidget(self.status_label)
         
         layout.addWidget(process_group)
         
         # Search section
         search_group = QGroupBox("Search & Database")
+        # lock the group to a fixed height so contents won't be compressed vertically
+        search_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        # increase fixed height so labels, inputs, slider and buttons fit comfortably
+        search_group.setFixedHeight(240)
+        # also set minimum height to prevent any shrinking below this value
+        search_group.setMinimumHeight(240)
         search_layout = QVBoxLayout(search_group)
-        
-        search_layout.addWidget(QLabel("Search Database:"))
+        search_layout.setSpacing(6)  # Consistent spacing
+        search_layout.setContentsMargins(8, 8, 8, 8)  # Consistent margins
+
+        db_label = QLabel("Search Database:")
+        db_label.setFixedHeight(18)
+        search_layout.addWidget(db_label)
         self.search_db_combo = QComboBox()
+        # lock height only; allow width to expand
+        self.search_db_combo.setFixedHeight(25)
+        self.search_db_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         search_layout.addWidget(self.search_db_combo)
-        
-        search_layout.addWidget(QLabel("Search Query:"))
+
+        query_label = QLabel("Search Query:")
+        query_label.setFixedHeight(18)
+        search_layout.addWidget(query_label)
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("Enter search terms...")
         self.search_edit.returnPressed.connect(self.search_descriptions)
+        self.search_edit.setFixedHeight(30)
+        self.search_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         search_layout.addWidget(self.search_edit)
+
+        self.threshold_label = QLabel("Similarity Threshold: 0.40")
+        self.threshold_label.setFixedHeight(18)
+        search_layout.addWidget(self.threshold_label)
         
         self.threshold_slider = QSlider(Qt.Horizontal)
         self.threshold_slider.setMinimum(0)
@@ -900,44 +1131,55 @@ class MainWindow(QMainWindow):
         self.threshold_slider.setValue(40)  # Default to 0.4
         self.threshold_slider.setTickInterval(5)
         self.threshold_slider.setTickPosition(QSlider.TicksBelow)
-
-        self.threshold_label = QLabel("Similarity Threshold: 0.40")
-
+        self.threshold_slider.setFixedHeight(22)
         self.threshold_slider.valueChanged.connect(self.update_threshold_label)
-
-        search_layout.addWidget(self.threshold_label)
         search_layout.addWidget(self.threshold_slider)
         
+        # Search buttons row
+        search_buttons_layout = QHBoxLayout()
         self.search_btn = QPushButton("Search")
         self.search_btn.clicked.connect(self.search_descriptions)
-        search_layout.addWidget(self.search_btn)
+        self.search_btn.setMinimumWidth(100)  # Ensure minimum width
+        self.search_btn.setFixedHeight(25)
+        search_buttons_layout.addWidget(self.search_btn)
         
         refresh_db_btn = QPushButton("Refresh Databases")
         refresh_db_btn.clicked.connect(self.refresh_databases)
-        search_layout.addWidget(refresh_db_btn)
+        refresh_db_btn.setMinimumWidth(120)  # Ensure minimum width
+        refresh_db_btn.setFixedHeight(25)
+        search_buttons_layout.addWidget(refresh_db_btn)
+        search_layout.addLayout(search_buttons_layout)
         
         layout.addWidget(search_group)
         
-        # Verbose output
+        # Verbose output - should shrink when window is smaller and expand when larger
         verbose_group = QGroupBox("Verbose Output")
+        # allow the group to prefer its natural size so it can shrink
+        verbose_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
         verbose_layout = QVBoxLayout(verbose_group)
-        
+        verbose_layout.setContentsMargins(8, 8, 8, 8)
+
         self.verbose_text = QTextEdit()
-        self.verbose_text.setMaximumHeight(150)
+        # allow the widget to shrink vertically before scrollbars appear
+        self.verbose_text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        # smaller minimum so verbose doesn't dominate space
+        self.verbose_text.setMinimumHeight(70)
         self.verbose_text.setReadOnly(True)
         verbose_layout.addWidget(self.verbose_text)
-        
+
         layout.addWidget(verbose_group)
         
-        layout.addStretch()
         return panel
     
     def create_results_panel(self):
         panel = QWidget()
+        panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
         
         # Tab widget for different views
         self.tab_widget = QTabWidget()
+        self.tab_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout.addWidget(self.tab_widget)
         
         # Image explorer tab
@@ -956,15 +1198,19 @@ class MainWindow(QMainWindow):
     
     def create_image_explorer(self):
         widget = QWidget()
+        widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
         
         # Scroll area for images
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
         scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         
         self.image_container = QWidget()
+        self.image_container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.image_grid_layout = QGridLayout(self.image_container)
         self.image_grid_layout.setSpacing(10)
         
@@ -975,9 +1221,12 @@ class MainWindow(QMainWindow):
     
     def create_search_results(self):
         widget = QWidget()
+        widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
         
         self.search_table = QTableWidget()
+        self.search_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.search_table.setColumnCount(4)
         self.search_table.setHorizontalHeaderLabels(["Image", "Image Path", "Description", "Date"])
         self.search_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -989,27 +1238,34 @@ class MainWindow(QMainWindow):
     
     def create_descriptions_explorer(self):
         widget = QWidget()
+        widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout = QVBoxLayout(widget)
-        
+        layout.setContentsMargins(8, 8, 8, 8)  # Add proper margins
+        layout.setSpacing(8)  # Add proper spacing
         
         db_select_layout = QHBoxLayout()
         db_select_layout.addWidget(QLabel("Database:"))
 
         self.desc_db_combo = QComboBox()
+        # prefer flexible width but keep usable minimum
+        self.desc_db_combo.setMinimumWidth(220)
+        self.desc_db_combo.setFixedHeight(28)
+        self.desc_db_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         db_select_layout.addWidget(self.desc_db_combo)
-        self.desc_db_combo.setFixedWidth(300) 
+        
         self.load_desc_button = QPushButton("Load Descriptions")
-        self.load_desc_button.setFixedWidth(150) 
+        self.load_desc_button.setMinimumWidth(120)
+        self.load_desc_button.setFixedHeight(28)
         self.load_desc_button.clicked.connect(self.load_descriptions)
         db_select_layout.addStretch()
         db_select_layout.addWidget(self.load_desc_button)
 
-        
         layout.addLayout(db_select_layout)
 
 
         # Descriptions table
         self.descriptions_table = QTableWidget()
+        self.descriptions_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.descriptions_table.setColumnCount(6)
         self.descriptions_table.setHorizontalHeaderLabels([
             "Image", "Description", "Vision Model", "Embedding Model", "Date", "Path"
@@ -1174,13 +1430,32 @@ class MainWindow(QMainWindow):
             QScrollBar:vertical {
                 background-color: #2b2b2b;
                 width: 15px;
+                border: none;
             }
             QScrollBar::handle:vertical {
                 background-color: #555;
                 border-radius: 7px;
+                min-height: 30px;
+                margin: 15px 0 15px 0;  /* Keep clear of arrows */
             }
             QScrollBar::handle:vertical:hover {
                 background-color: #0078d4;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                background-color: #2b2b2b;
+                border: none;
+                height: 15px;
+            }
+            QScrollBar::add-line:vertical:hover, QScrollBar::sub-line:vertical:hover {
+                background-color: #0078d4;
+            }
+            QScrollBar::up-arrow:vertical, QScrollBar::down-arrow:vertical {
+                border: none;
+                width: 0;
+                height: 0;
+            }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+                background-color: #2b2b2b;
             }
             QScrollArea {
                 background-color: #2b2b2b;
